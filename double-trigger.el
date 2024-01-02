@@ -1,6 +1,6 @@
 ;;; double-trigger.el --- Trigger a function by pressing two keys quickly -*- lexical-binding: t; -*-
 
-;; Copyright (c) 2023 Zhexuan Chen <2915234902@qq.com>
+;; Copyright (c) 2023-2024 Zhexuan Chen <2915234902@qq.com>
 
 ;; Author: Zhexuan Chen <2915234902@qq.com>
 ;; URL: https://github.com/CloseToZero/double-trigger
