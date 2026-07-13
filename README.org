@@ -1,22 +1,18 @@
 * Double Trigger
 
-A small, non-blocking Emacs package for running a function after two
-characters are entered quickly.
+A small Emacs package for running a function after two characters are
+entered quickly.
 
-The first key is deferred without changing the buffer.  When the next
-command is the configured second key and arrives before the deadline,
-Double Trigger consumes the pair and runs the trigger function.  Otherwise,
-it replays the deferred key through Emacs's normal command loop.
+After the first key, Double Trigger waits up to =double-trigger-delay= for
+the next input event.  A matching second key replaces the current command
+with the trigger function.  On a timeout, the first key's normal command
+runs.  A nonmatching event is returned to the command loop, where it runs
+after the first key's command.
 
-Double Trigger does not call =read-event= and never rewrites
-=buffer-undo-list=.  Emacs remains responsive while a key is pending, and
-normal insertion, input methods, keyboard macros, and undo grouping are
-handled by the command loop.  A lone first key can appear up to
-=double-trigger-delay= seconds later; any following command releases it
-immediately.  If command input is already waiting while Emacs finishes the
-first key, Double Trigger gives that next command one chance to complete the
-pair.  This keeps command-loop stalls from turning a quickly typed pair into
-literal text.
+The synchronous lookahead keeps the command loop from observing a partial
+key pair.  It does not insert or delete speculative text, rewrite
+=buffer-undo-list=, or defer the first key through a timer.  A lone first
+key can therefore appear up to =double-trigger-delay= seconds later.
 
 ** Configuration
 
@@ -38,9 +34,9 @@ Detection starts only when the first key resolves to =self-insert-command=.
 This leaves command states, read-only keymaps, and modes where the key has a
 different meaning untouched.
 
-Starting with version 0.3, both =double-trigger-insert-fn= and
-=double-trigger-delete-fn= are obsolete because candidate keys are deferred
-instead of being inserted and removed speculatively.
+Both =double-trigger-insert-fn= and =double-trigger-delete-fn= are retained
+for compatibility but obsolete.  Detection no longer inserts or removes a
+candidate key speculatively.
 
 ** Tests
 
