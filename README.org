@@ -3,11 +3,20 @@
 A small, non-blocking Emacs package for running a function after two
 characters are entered quickly.
 
-The first key is handled by its normal command immediately.  When the next
+The first key is deferred without changing the buffer.  When the next
 command is the configured second key and arrives before the deadline,
-Double Trigger removes the first insertion and runs the trigger function in
-place of the second command.  It does not call =read-event=, so typing the
-first key never waits for the timeout.
+Double Trigger consumes the pair and runs the trigger function.  Otherwise,
+it replays the deferred key through Emacs's normal command loop.
+
+Double Trigger does not call =read-event= and never rewrites
+=buffer-undo-list=.  Emacs remains responsive while a key is pending, and
+normal insertion, input methods, keyboard macros, and undo grouping are
+handled by the command loop.  A lone first key can appear up to
+=double-trigger-delay= seconds later; any following command releases it
+immediately.  If command input is already waiting while Emacs finishes the
+first key, Double Trigger gives that next command one chance to complete the
+pair.  This keeps command-loop stalls from turning a quickly typed pair into
+literal text.
 
 ** Configuration
 
@@ -25,13 +34,13 @@ Use =double-trigger-inhibit= for a temporary dynamic override, or add
 zero-argument predicates to =double-trigger-inhibit-fns= to restrict the
 states and modes where detection is active.
 
-The first key must insert exactly one matching character immediately before
-point.  This guard prevents Double Trigger from deleting unrelated text in
-read-only buffers, overwrite mode, command states, or modes where the key
-does something other than self-insertion.
+Detection starts only when the first key resolves to =self-insert-command=.
+This leaves command states, read-only keymaps, and modes where the key has a
+different meaning untouched.
 
-Starting with version 0.2, =double-trigger-insert-fn= is obsolete because
-the first key's normal command performs the insertion directly.
+Starting with version 0.3, both =double-trigger-insert-fn= and
+=double-trigger-delete-fn= are obsolete because candidate keys are deferred
+instead of being inserted and removed speculatively.
 
 ** Tests
 

@@ -4,7 +4,7 @@
 
 ;; Author: Zhexuan Chen <2915234902@qq.com>
 ;; URL: https://github.com/CloseToZero/double-trigger
-;; Version: 0.2.0
+;; Version: 0.3.0
 ;; Package-Requires: ((emacs "24") (cl-lib "0.5"))
 
 ;; This file is NOT part of GNU Emacs.
@@ -28,10 +28,10 @@
 ;; characters in `double-trigger-keys' are entered within
 ;; `double-trigger-delay' seconds.
 ;;
-;; Detection is non-blocking: the first key runs normally.  If the next
-;; command is the second key and arrives before the deadline, the first
-;; insertion is removed and the second command is replaced by the
-;; trigger function.
+;; Detection is non-blocking and does not edit undo history.  The first
+;; key is deferred.  If the next command is the second key and arrives
+;; before the deadline, the pair is replaced by the trigger function.
+;; Otherwise the first key is replayed through the normal command loop.
 
 ;;; Code:
 
@@ -74,43 +74,55 @@ inhibited.")
 
 (defvar double-trigger-insert-fn #'double-trigger-default-insert-fn
   "Compatibility variable retained from double-trigger 0.1.
-The non-blocking implementation lets the first key's normal command run,
+The event-replay implementation lets the first key's normal command run,
 so this function is no longer called.")
 
 (make-obsolete-variable
  'double-trigger-insert-fn
- "The first key's normal command now performs insertion."
+ "The first key's normal command now performs insertion when replayed."
  "0.2.0")
 
 (defvar double-trigger-delete-fn #'double-trigger-default-delete-fn
-  "Function used to remove the first trigger character.
-By default, `double-trigger-default-delete-fn' deletes the character
-before point.  The function is called only after double-trigger has
-verified that the first key inserted exactly one character.")
+  "Compatibility variable retained from double-trigger 0.2.
+The event-replay implementation never inserts and then removes a
+candidate key, so this function is no longer called.")
+
+(make-obsolete-variable
+ 'double-trigger-delete-fn
+ "Candidate keys are deferred instead of being deleted."
+ "0.3.0")
 
 (cl-defstruct (double-trigger--candidate
                (:constructor double-trigger--make-candidate))
-  "State captured around a possible first trigger key."
+  "State for a deferred first trigger key."
   buffer
+  window
   time
-  point-before
-  size-before
-  modified-before
-  undo-list-before
-  point-after
-  tick-after)
+  delay
+  point
+  tick
+  event
+  second-event
+  grace
+  timer)
 
 (defvar double-trigger--candidate nil
   "Candidate waiting for the second trigger key.")
 
-(defvar double-trigger--pre-command-candidate nil
-  "Candidate captured before the current command.")
-
 (defvar double-trigger--trigger-function nil
   "Function to run for the trigger currently being dispatched.")
 
-(defvar double-trigger--skip-post-command nil
-  "Non-nil when the current command dispatched a trigger.")
+(defvar double-trigger--replay-keys nil
+  "Key vectors queued for replay without trigger detection.")
+
+(defvar double-trigger--restore-command nil
+  "Command identity restored after an internal no-op command.")
+
+(defvar double-trigger--restore-original-command nil
+  "Original command identity restored after an internal no-op command.")
+
+(defconst double-trigger--pending-input-poll-delay 0.01
+  "Seconds between checks while command input is already pending.")
 
 ;;;###autoload
 (define-minor-mode double-trigger-mode
@@ -122,17 +134,21 @@ This is a global minor mode."
   (if double-trigger-mode
       (progn
         (add-hook 'pre-command-hook #'double-trigger--pre-command-hook)
-        (add-hook 'post-command-hook #'double-trigger--post-command-hook))
+        (add-hook 'post-command-hook #'double-trigger--post-command-hook t))
     (remove-hook 'pre-command-hook #'double-trigger--pre-command-hook)
     (remove-hook 'post-command-hook #'double-trigger--post-command-hook)
     (double-trigger--clear-state)))
 
 (defun double-trigger--clear-state ()
   "Discard all pending trigger state."
+  (let ((candidate double-trigger--candidate))
+    (when candidate
+      (double-trigger--cancel-timer candidate)))
   (setq double-trigger--candidate nil
-        double-trigger--pre-command-candidate nil
         double-trigger--trigger-function nil
-        double-trigger--skip-post-command nil))
+        double-trigger--replay-keys nil
+        double-trigger--restore-command nil
+        double-trigger--restore-original-command nil))
 
 (defun double-trigger--valid-key-sequence-p ()
   "Return non-nil when `double-trigger-keys' has two characters."
@@ -154,62 +170,125 @@ This is a global minor mode."
 
 (defun double-trigger--current-key-p (n)
   "Return non-nil when the current command was trigger key N."
+  (double-trigger--current-event-p (elt double-trigger-keys n)))
+
+(defun double-trigger--current-event-p (event)
+  "Return non-nil when the current command consists of EVENT."
   (let ((keys (this-command-keys-vector)))
     (and (= (length keys) 1)
-         (equal (aref keys 0) (elt double-trigger-keys n)))))
+         (equal (aref keys 0) event))))
 
 (defun double-trigger--now ()
   "Return the current time as a floating-point number."
   (float-time))
 
-(defun double-trigger--capture-candidate (now)
-  "Capture buffer state before a possible first key at time NOW."
-  (double-trigger--make-candidate
-   :buffer (current-buffer)
-   :time now
-   :point-before (point)
-   :size-before (buffer-size)
-   :modified-before (buffer-modified-p)
-   :undo-list-before buffer-undo-list))
-
-(defun double-trigger--first-key-inserted-p (candidate)
-  "Return non-nil when CANDIDATE became one matching insertion."
-  (and (eq (current-buffer)
-           (double-trigger--candidate-buffer candidate))
-       (= (point)
-          (1+ (double-trigger--candidate-point-before candidate)))
-       (= (buffer-size)
-          (1+ (double-trigger--candidate-size-before candidate)))
-       (eq (char-before) (elt double-trigger-keys 0))))
+(defun double-trigger--self-inserting-command-p ()
+  "Return non-nil when the current key would self-insert."
+  (or (eq this-command #'self-insert-command)
+      (eq this-original-command #'self-insert-command)))
 
 (defun double-trigger--candidate-current-p (candidate now)
-  "Return non-nil when CANDIDATE is unchanged and valid at NOW."
+  "Return non-nil when deferred CANDIDATE is valid at NOW."
   (and candidate
        (buffer-live-p (double-trigger--candidate-buffer candidate))
        (eq (current-buffer)
            (double-trigger--candidate-buffer candidate))
-       (= (point) (double-trigger--candidate-point-after candidate))
+       (eq (selected-window)
+           (double-trigger--candidate-window candidate))
+       (= (point) (double-trigger--candidate-point candidate))
        (= (buffer-chars-modified-tick)
-          (double-trigger--candidate-tick-after candidate))
-       (let ((elapsed (- now (double-trigger--candidate-time candidate))))
-         (and (>= elapsed 0)
-              (<= elapsed double-trigger-delay)))))
+          (double-trigger--candidate-tick candidate))
+       (or (double-trigger--candidate-grace candidate)
+           (let ((elapsed (- now
+                             (double-trigger--candidate-time candidate))))
+             (and (>= elapsed 0)
+                  (<= elapsed
+                      (double-trigger--candidate-delay candidate)))))))
 
-(defun double-trigger--remove-first-key (candidate)
-  "Remove the insertion represented by CANDIDATE.
-Return non-nil when the original buffer state was restored."
-  (funcall double-trigger-delete-fn)
-  (when (and (eq (current-buffer)
-                 (double-trigger--candidate-buffer candidate))
-             (= (point)
-                (double-trigger--candidate-point-before candidate))
-             (= (buffer-size)
-                (double-trigger--candidate-size-before candidate)))
-    (setq buffer-undo-list
-          (double-trigger--candidate-undo-list-before candidate))
-    (set-buffer-modified-p
-     (double-trigger--candidate-modified-before candidate))
-    t))
+(defun double-trigger--cancel-timer (candidate)
+  "Cancel CANDIDATE's timeout timer."
+  (let ((timer (double-trigger--candidate-timer candidate)))
+    (when timer
+      (cancel-timer timer)
+      (setf (double-trigger--candidate-timer candidate) nil))))
+
+(defun double-trigger--queue-events (events replay-keys)
+  "Queue EVENTS and bypass detection for REPLAY-KEYS.
+EVENTS is a list of input events.  REPLAY-KEYS is a list of key
+vectors corresponding to commands which must run normally.  Queue the
+events after input-method processing so they are not translated twice."
+  (setq double-trigger--replay-keys
+        (append replay-keys double-trigger--replay-keys)
+        unread-post-input-method-events
+        (append events
+                (append unread-post-input-method-events nil))))
+
+(defun double-trigger--replay-command-p ()
+  "Consume and return non-nil for the next queued replay command."
+  (when double-trigger--replay-keys
+    (let ((keys (this-command-keys-vector)))
+      (if (equal keys (car double-trigger--replay-keys))
+          (progn
+            (setq double-trigger--replay-keys
+                  (cdr double-trigger--replay-keys))
+            t)
+        (setq double-trigger--replay-keys nil)
+        nil))))
+
+(defun double-trigger--release-candidate (candidate &optional keys)
+  "Replay CANDIDATE before optional current command KEYS."
+  (double-trigger--cancel-timer candidate)
+  (setq double-trigger--candidate nil)
+  (let ((event (double-trigger--candidate-event candidate)))
+    (double-trigger--queue-events
+     (cons event (append keys nil))
+     (list (vector event)))))
+
+(defun double-trigger--timeout (candidate)
+  "Replay CANDIDATE after its detection window expires."
+  (when (eq candidate double-trigger--candidate)
+    (setf (double-trigger--candidate-timer candidate) nil)
+    (if (input-pending-p)
+        (setf (double-trigger--candidate-grace candidate) t
+              (double-trigger--candidate-timer candidate)
+              (run-at-time double-trigger--pending-input-poll-delay nil
+                           #'double-trigger--timeout candidate))
+      (double-trigger--release-candidate candidate))))
+
+(defun double-trigger--arm-candidate (now)
+  "Defer the current first trigger key at time NOW."
+  (let* ((candidate
+          (double-trigger--make-candidate
+           :buffer (current-buffer)
+           :window (selected-window)
+           :time now
+           :delay double-trigger-delay
+           :point (point)
+           :tick (buffer-chars-modified-tick)
+           :event (elt double-trigger-keys 0)
+           :second-event (elt double-trigger-keys 1)))
+         (timer (run-at-time (double-trigger--candidate-delay candidate) nil
+                             #'double-trigger--timeout candidate)))
+    (setf (double-trigger--candidate-timer candidate) timer)
+    (setq double-trigger--candidate candidate
+          double-trigger--restore-command this-command
+          double-trigger--restore-original-command this-original-command
+          this-command #'double-trigger--ignore-command
+          this-original-command #'double-trigger--ignore-command)))
+
+(defun double-trigger--ignore-command ()
+  "Do nothing while deferred input is queued for replay."
+  (interactive))
+
+(declare-function evil-set-command-property "evil-common"
+                  (command property value))
+
+(with-eval-after-load 'evil
+  ;; Evil records unannotated commands as repeatable keystrokes.  This
+  ;; internal command consumes an event only so it can be replayed later.
+  (when (fboundp 'evil-set-command-property)
+    (evil-set-command-property
+     #'double-trigger--ignore-command :repeat 'ignore)))
 
 (defun double-trigger--run-trigger ()
   "Run the trigger function selected by the pre-command hook."
@@ -220,46 +299,53 @@ Return non-nil when the original buffer state was restored."
       (funcall fn))))
 
 (defun double-trigger--pre-command-hook ()
-  "Detect a second key or capture state before a possible first key."
+  "Detect a pair or defer and replay a possible first key."
   (with-demoted-errors "double-trigger: Error %S"
-    (setq double-trigger--pre-command-candidate nil
-          double-trigger--skip-post-command nil)
-    (if (not (double-trigger--enabled-p))
-        (setq double-trigger--candidate nil)
-      (let* ((first-key-p (double-trigger--current-key-p 0))
-             (second-key-p (double-trigger--current-key-p 1))
-             (relevant-key-p (or first-key-p second-key-p))
-             (now (and relevant-key-p (double-trigger--now)))
-             (candidate double-trigger--candidate))
-        (setq double-trigger--candidate nil)
-        (cond
-         ((and second-key-p
-               (double-trigger--candidate-current-p candidate now)
-               (double-trigger--remove-first-key candidate))
-          (setq double-trigger--trigger-function double-trigger-fn
-                double-trigger--skip-post-command t
-                this-command #'double-trigger--run-trigger
-                this-original-command #'double-trigger--run-trigger))
-         (first-key-p
-          (setq double-trigger--pre-command-candidate
-                (double-trigger--capture-candidate now))))))))
+    (cond
+     ((double-trigger--replay-command-p))
+     (double-trigger--candidate
+      (let* ((candidate double-trigger--candidate)
+             (keys (this-command-keys-vector))
+             (second-key-p
+              (double-trigger--current-event-p
+               (double-trigger--candidate-second-event candidate)))
+             (enabled-p (double-trigger--enabled-p))
+             (now (and second-key-p enabled-p (double-trigger--now))))
+        (if (and now
+                 (double-trigger--candidate-current-p candidate now))
+            (progn
+              (double-trigger--cancel-timer candidate)
+              (setq double-trigger--candidate nil
+                    double-trigger--trigger-function double-trigger-fn
+                    this-command #'double-trigger--run-trigger
+                    this-original-command #'double-trigger--run-trigger))
+          (double-trigger--release-candidate candidate keys)
+          (setq double-trigger--restore-command last-command
+                double-trigger--restore-original-command last-command
+                this-command #'double-trigger--ignore-command
+                this-original-command #'double-trigger--ignore-command))))
+     ((and (double-trigger--enabled-p)
+           (double-trigger--current-key-p 0)
+           (double-trigger--self-inserting-command-p))
+      (double-trigger--arm-candidate (double-trigger--now))))))
 
 (defun double-trigger--post-command-hook ()
-  "Arm a candidate after the first key inserted one character."
+  "Restore command identity after an internal no-op command."
   (with-demoted-errors "double-trigger: Error %S"
-    (let ((candidate double-trigger--pre-command-candidate))
-      (setq double-trigger--pre-command-candidate nil)
-      (cond
-       (double-trigger--skip-post-command
-        (setq double-trigger--skip-post-command nil))
-       ((and candidate
-             (double-trigger--first-key-inserted-p candidate))
-        (setf (double-trigger--candidate-point-after candidate) (point)
-              (double-trigger--candidate-tick-after candidate)
-              (buffer-chars-modified-tick))
-        (setq double-trigger--candidate candidate))
-       (t
-        (setq double-trigger--candidate nil))))))
+    (when double-trigger--restore-command
+      (when (and double-trigger--candidate
+                 (not executing-kbd-macro)
+                 (input-pending-p))
+        ;; The next physical event arrived before this command finished.
+        ;; Do not let command-loop work make that pair look slow.
+        (setf (double-trigger--candidate-grace double-trigger--candidate) t))
+      (setq this-command double-trigger--restore-command
+            this-original-command double-trigger--restore-original-command
+            double-trigger--restore-command nil
+            double-trigger--restore-original-command nil)
+      (when (and (eq this-command #'self-insert-command)
+                 (fboundp 'undo-auto-amalgamate))
+        (undo-auto-amalgamate)))))
 
 (defun double-trigger-default-insert-fn ()
   "Insert the current key unless the buffer is read-only.
