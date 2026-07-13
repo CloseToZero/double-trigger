@@ -1,6 +1,44 @@
 * Double Trigger
 
-TODO
+A small, non-blocking Emacs package for running a function after two
+characters are entered quickly.
+
+The first key is handled by its normal command immediately.  When the next
+command is the configured second key and arrives before the deadline,
+Double Trigger removes the first insertion and runs the trigger function in
+place of the second command.  It does not call =read-event=, so typing the
+first key never waits for the timeout.
+
+** Configuration
+
+#+begin_src emacs-lisp
+(require 'double-trigger)
+
+(setq double-trigger-keys "ii"
+      double-trigger-delay 0.2
+      double-trigger-fn #'keyboard-quit)
+
+(double-trigger-mode 1)
+#+end_src
+
+Use =double-trigger-inhibit= for a temporary dynamic override, or add
+zero-argument predicates to =double-trigger-inhibit-fns= to restrict the
+states and modes where detection is active.
+
+The first key must insert exactly one matching character immediately before
+point.  This guard prevents Double Trigger from deleting unrelated text in
+read-only buffers, overwrite mode, command states, or modes where the key
+does something other than self-insertion.
+
+Starting with version 0.2, =double-trigger-insert-fn= is obsolete because
+the first key's normal command performs the insertion directly.
+
+** Tests
+
+#+begin_src shell
+emacs -Q --batch -L . -l test/double-trigger-test.el \
+  -f ert-run-tests-batch-and-exit
+#+end_src
 
 * Acknowledgments
 
