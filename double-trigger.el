@@ -4,8 +4,8 @@
 
 ;; Author: Zhexuan Chen <2915234902@qq.com>
 ;; URL: https://github.com/CloseToZero/double-trigger
-;; Version: 0.4.0
-;; Package-Requires: ((emacs "24") (cl-lib "0.5"))
+;; Version: 0.4.1
+;; Package-Requires: ((emacs "24"))
 
 ;; This file is NOT part of GNU Emacs.
 
@@ -35,8 +35,6 @@
 ;; rewrites undo history.
 
 ;;; Code:
-
-(require 'cl-lib)
 
 (defgroup double-trigger nil
   "Trigger a function by pressing two keys quickly."
@@ -126,8 +124,8 @@ This is a global minor mode."
        (numberp double-trigger-delay)
        (>= double-trigger-delay 0)
        (not double-trigger-inhibit)
-       (not (cl-some (lambda (fn) (funcall fn))
-                     double-trigger-inhibit-fns))))
+       (not (run-hook-with-args-until-success
+             'double-trigger-inhibit-fns))))
 
 (defun double-trigger--current-key-p (n)
   "Return non-nil when the current command was trigger key N."
@@ -142,6 +140,8 @@ This is a global minor mode."
 
 (defun double-trigger--read-event ()
   "Read a possible second trigger event without recording it twice."
+  ;; `inhibit--record-char' is an internal variable, not part of any
+  ;; announced API.  Recheck it when upgrading Emacs.
   (let ((inhibit--record-char t))
     (read-event nil nil double-trigger-delay)))
 
