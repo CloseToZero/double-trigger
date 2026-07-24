@@ -145,6 +145,13 @@ This is a global minor mode."
   (let ((inhibit--record-char t))
     (read-event nil nil double-trigger-delay)))
 
+(defun double-trigger--macro-out-of-events-p ()
+  "Return non-nil when a replaying keyboard macro has no events left.
+At that point `read-event' would fall through to real input and the
+lookahead could swallow a key typed right after the macro ends."
+  (and executing-kbd-macro
+       (>= executing-kbd-macro-index (length executing-kbd-macro))))
+
 (defun double-trigger--restore-event (event)
   "Return nonmatching EVENT to the front of the command input queue."
   (setq unread-command-events (cons event unread-command-events)))
@@ -167,7 +174,8 @@ This is a global minor mode."
   (with-demoted-errors "double-trigger: Error %S"
     (when (and (double-trigger--enabled-p)
                (double-trigger--current-key-p 0)
-               (double-trigger--self-inserting-command-p))
+               (double-trigger--self-inserting-command-p)
+               (not (double-trigger--macro-out-of-events-p)))
       (let ((event (double-trigger--read-event)))
         (cond
          ((and (characterp event)

@@ -51,7 +51,11 @@
     (let ((double-trigger-delay 0.137)
           observed-delay)
       (setq double-trigger-fn #'ignore)
-      (cl-letf (((symbol-function 'read-event)
+      ;; The single-key macro stands in for interactive typing, so
+      ;; the end-of-macro guard is stubbed out.
+      (cl-letf (((symbol-function 'double-trigger--macro-out-of-events-p)
+                 #'ignore)
+                ((symbol-function 'read-event)
                  (lambda (_prompt _inherit delay)
                    (setq observed-delay delay)
                    nil)))
@@ -65,7 +69,11 @@
           (trigger-count 0))
       (setq double-trigger-fn
             (lambda () (setq trigger-count (1+ trigger-count))))
-      (cl-letf (((symbol-function 'double-trigger--read-event)
+      ;; The macro stands in for interactive typing, so the
+      ;; end-of-macro guard is stubbed out.
+      (cl-letf (((symbol-function 'double-trigger--macro-out-of-events-p)
+                 #'ignore)
+                ((symbol-function 'double-trigger--read-event)
                  (lambda () (pop events))))
         (execute-kbd-macro (vector ?i ?i)))
       (should-not events)
@@ -77,7 +85,11 @@
     (let ((trigger-count 0))
       (setq double-trigger-fn
             (lambda () (setq trigger-count (1+ trigger-count))))
-      (cl-letf (((symbol-function 'double-trigger--read-event)
+      ;; The single-key macro stands in for interactive typing, so
+      ;; the end-of-macro guard is stubbed out.
+      (cl-letf (((symbol-function 'double-trigger--macro-out-of-events-p)
+                 #'ignore)
+                ((symbol-function 'double-trigger--read-event)
                  (lambda ()
                    (should (equal (buffer-string) ""))
                    (should-not (buffer-modified-p))
@@ -87,6 +99,18 @@
       (should (= trigger-count 1))
       (should (equal (buffer-string) ""))
       (should-not buffer-undo-list))))
+
+(ert-deftest double-trigger-no-lookahead-when-macro-out-of-events ()
+  "A macro ending in the first trigger key must not read real input.
+Without the guard, replaying such a macro leaves `read-event' waiting
+in real time and it can swallow a key typed right after the macro."
+  (double-trigger-test--with-buffer
+    (setq double-trigger-fn #'ignore)
+    (cl-letf (((symbol-function 'read-event)
+               (lambda (&rest _)
+                 (ert-fail "Double Trigger read past the end of a macro"))))
+      (execute-kbd-macro "i"))
+    (should (equal (buffer-string) "i"))))
 
 (ert-deftest double-trigger-nonmatch-preserves-event-order ()
   (double-trigger-test--with-buffer
